@@ -2,8 +2,9 @@ import type { BaseChatMemory } from '@langchain/community/memory/chat_memory';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base'; // Added
 import type { LLMResult } from '@langchain/core/outputs'; // Added
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
-import { HumanMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
+// Import specific message types
+import { AIMessage, HumanMessage, ToolMessage, BaseMessage } from '@langchain/core/messages'; // Ensure BaseMessage is imported
+import type { InvalidToolCall, ToolCall } from '@langchain/core/messages/tool'; // Import ToolCall types
 import type { BaseMessagePromptTemplateLike } from '@langchain/core/prompts';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { RunnableSequence } from '@langchain/core/runnables';
@@ -14,7 +15,7 @@ import { AgentExecutor, createToolCallingAgent } from 'langchain/agents';
 import type { ToolsAgentAction } from 'langchain/dist/agents/tool_calling/output_parser';
 import { omit } from 'lodash';
 import { BINARY_ENCODING, jsonParse, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
-import type { IExecuteFunctions, INodeExecutionData } from 'n8n-workflow'; // Added ILogger
+import type { IExecuteFunctions, INodeExecutionData, ILogger } from 'n8n-workflow'; // Added ILogger
 import type { ZodObject } from 'zod';
 import { z } from 'zod';
 
@@ -288,7 +289,8 @@ export async function getChatModel(ctx: IExecuteFunctions): Promise<BaseChatMode
 }
 
 /**
- * Retrieves the memory instance from the input connection if it is connected
+ * Retrieves the memory instance from the input connection.
+ * NO LONGER WRAPS saveContext.
  *
  * @param ctx - The execution context
  * @returns The connected memory (if any)
@@ -296,9 +298,13 @@ export async function getChatModel(ctx: IExecuteFunctions): Promise<BaseChatMode
 export async function getOptionalMemory(
 	ctx: IExecuteFunctions,
 ): Promise<BaseChatMemory | undefined> {
-	return (await ctx.getInputConnectionData(NodeConnectionTypes.AiMemory, 0)) as
+	// Get the original memory (or undefined)
+	const memory = (await ctx.getInputConnectionData(NodeConnectionTypes.AiMemory, 0)) as
 		| BaseChatMemory
 		| undefined;
+
+	// Return the original memory object directly
+	return memory;
 }
 
 /**
@@ -400,6 +406,125 @@ export function preparePrompt(messages: BaseMessagePromptTemplateLike[]): ChatPr
    Callback Handlers
 ----------------------------------------------------------- */
 
+class MemoryStepsCallbackHandler extends BaseCallbackHandler {
+	name = 'MemoryStepsCallbackHandler';
+	private lastAction: AgentAction | undefined;
+	// Array to collect intermediate messages
+	private intermediateMessages: BaseMessage[] = [];
+
+	constructor(private logger: ILogger) {
+		// Memory no longer needed here
+		super();
+		// this.logger.debug('MemoryStepsCallbackHandler initialized.');
+	}
+
+	async handleAgentAction(action: AgentAction): Promise<void> {
+		// Store the action, don't save yet
+		// this.logger.debug(`[MemoryCallback] Storing action: ${action.tool} with toolCallId: ${action.toolCallId}`);
+		this.lastAction = action;
+	}
+
+	async handleToolEnd(output: string, runId: string): Promise<void> {
+		if (this.lastAction) {
+			const action = this.lastAction;
+			this.lastAction = undefined; // Clear the stored action
+
+			// this.logger.debug('[MemoryCallback] Collecting intermediate step messages.');
+
+			// 1. Create AI message representing the thought & tool call
+			const aiContent = `Thought: ${action.log}`; // Keep content concise, details are in tool_calls
+			// Construct the tool_calls array for the AIMessage
+			const toolCalls: ToolCall[] = [];
+			if (action.toolCallId) {
+				toolCalls.push({
+					id: action.toolCallId,
+					name: action.tool,
+					// Ensure args are stringified if they are objects
+					args:
+						typeof action.toolInput === 'string' ? jsonParse(action.toolInput) : action.toolInput, // Use jsonParse safely
+					type: 'tool_call', // Explicitly set type
+				});
+			}
+			// Create AIMessage with tool_calls
+			const aiMessage = new AIMessage({
+				content: aiContent, // Thought process
+				tool_calls: toolCalls, // Include the tool call info
+				// Optionally add invalid_tool_calls if needed, but likely empty here
+				invalid_tool_calls: [],
+			});
+			this.intermediateMessages.push(aiMessage);
+
+			// 2. Create Tool message representing the observation
+			const toolMessage = new ToolMessage({
+				content: output,
+				tool_call_id: action.toolCallId ?? `tool_call_${runId}`, // Use the same ID
+				name: action.tool, // Include tool name for clarity if needed, though redundant with AIMessage
+			});
+			this.intermediateMessages.push(toolMessage);
+		} else {
+			// this.logger.warn('[MemoryCallback] handleToolEnd called without a preceding handleAgentAction.');
+		}
+	}
+
+	async handleToolError(error: Error | unknown, runId: string): Promise<void> {
+		if (this.lastAction) {
+			const action = this.lastAction;
+			this.lastAction = undefined; // Clear the stored action
+			const errorMessage = error instanceof Error ? error.message : String(error);
+
+			// this.logger.debug('[MemoryCallback] Collecting intermediate error step messages.');
+
+			// 1. Create AI message representing the thought & tool call attempt
+			const aiContent = `Thought: ${action.log}`;
+			const toolCalls: ToolCall[] = [];
+			const invalidToolCalls: InvalidToolCall[] = []; // Use invalidToolCalls for errors
+
+			if (action.toolCallId) {
+				// Represent the failed call in invalid_tool_calls
+				invalidToolCalls.push({
+					id: action.toolCallId,
+					name: action.tool,
+					args:
+						typeof action.toolInput === 'string' ? jsonParse(action.toolInput) : action.toolInput, // Use jsonParse safely
+					error: errorMessage, // Add error message here
+					type: 'invalid_tool_call', // Explicitly set type
+				});
+			}
+			// Create AIMessage with invalid_tool_calls
+			const aiMessage = new AIMessage({
+				content: aiContent, // Thought process
+				tool_calls: toolCalls, // Likely empty on error
+				invalid_tool_calls: invalidToolCalls, // Include the failed tool call info
+			});
+			this.intermediateMessages.push(aiMessage);
+
+			// 2. Create Tool message representing the error observation
+			// It might be redundant if the error is in invalid_tool_calls, but can be useful
+			const toolMessage = new ToolMessage({
+				content: `Tool Error: ${errorMessage}`,
+				tool_call_id: action.toolCallId ?? `tool_call_${runId}_error`, // Use the same ID
+				name: action.tool,
+			});
+			this.intermediateMessages.push(toolMessage);
+		} else {
+			// this.logger.warn('[MemoryCallback] handleToolError called without a preceding handleAgentAction.');
+		}
+	}
+
+	// Method to retrieve collected messages
+	getIntermediateMessages(): BaseMessage[] {
+		return this.intermediateMessages;
+	}
+
+	// Ensure any stored action is cleared if the agent finishes without a final tool use
+	async handleAgentEnd(action: AgentFinish): Promise<void> {
+		if (this.lastAction) {
+			// this.logger.debug(`[MemoryCallback] Clearing stored action for tool ${this.lastAction.tool} as agent finished.`);
+			this.lastAction = undefined;
+		}
+	}
+}
+
 class TokenUsageCallbackHandler extends BaseCallbackHandler {
 	name = 'TokenUsageCallbackHandler';
 	promptTokens = 0;
@@ -445,7 +570,7 @@ class TokenUsageCallbackHandler extends BaseCallbackHandler {
  * @returns The array of execution data for all processed items
  */
 export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-	this.logger.debug('Executing Tools Agent');
+	// this.logger.debug('Executing Tools Agent');
 
 	const returnData: INodeExecutionData[] = [];
 	const items = this.getInputData();
@@ -454,9 +579,10 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 
 	for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
 		const tokenCallbackHandler = new TokenUsageCallbackHandler(); // Instantiate handler
+		let memoryStepsCallbackHandler: MemoryStepsCallbackHandler | undefined; // Keep reference
 		try {
 			const model = await getChatModel(this);
-			const memory = await getOptionalMemory(this);
+			const memory = await getOptionalMemory(this); // Use updated getOptionalMemory
 
 			// Get the raw input
 			const rawInput = getPromptInputByType({
@@ -473,6 +599,7 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				systemMessage?: string;
 				maxIterations?: number;
 				returnIntermediateSteps?: boolean;
+				saveIntermediateStepsToMemory?: boolean; // Added option
 				passthroughBinaryImages?: boolean;
 				context?: string; // Added context option
 				outputTokensConsumption?: boolean; // Added outputTokensConsumption option
@@ -507,11 +634,16 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				getAgentStepsParser(outputParser, memory),
 				fixEmptyContentMessage,
 			]);
+
+			// Determine if intermediate steps need to be returned by the executor
+			const shouldReturnIntermediateSteps =
+				options.returnIntermediateSteps === true || options.saveIntermediateStepsToMemory === true;
+
 			const executor = AgentExecutor.fromAgentAndTools({
 				agent: runnableAgent,
-				memory,
+				memory, // Pass the ORIGINAL memory
 				tools,
-				returnIntermediateSteps: options.returnIntermediateSteps === true,
+				returnIntermediateSteps: shouldReturnIntermediateSteps, // Use calculated value
 				maxIterations: options.maxIterations ?? 10,
 			});
 
@@ -519,6 +651,11 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 			const callbacks: BaseCallbackHandler[] = [];
 			if (options.outputTokensConsumption) {
 				callbacks.push(tokenCallbackHandler); // Add token handler if option is enabled
+			}
+			// Add memory steps handler if option enabled and memory connected
+			if (memory && options.saveIntermediateStepsToMemory) {
+				memoryStepsCallbackHandler = new MemoryStepsCallbackHandler(this.logger);
+				callbacks.push(memoryStepsCallbackHandler);
 			}
 
 			// Invoke the executor with the cleaned input and system message.
@@ -536,6 +673,63 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				},
 			);
 
+			// --- Post-execution Memory Handling for Intermediate Steps ---
+			if (memory && options.saveIntermediateStepsToMemory && memoryStepsCallbackHandler) {
+				const intermediateMessages = memoryStepsCallbackHandler.getIntermediateMessages();
+				if (intermediateMessages.length > 0) {
+					// this.logger.info(`[Memory Post-Processing] Re-ordering history to include ${intermediateMessages.length} intermediate messages.`);
+					// biome-ignore lint/suspicious/noExplicitAny: Checking for method existence
+					if (
+						memory.chatHistory &&
+						typeof (memory.chatHistory as any).getMessages === 'function' &&
+						typeof (memory.chatHistory as any).clear === 'function' &&
+						typeof (memory.chatHistory as any).addMessages === 'function'
+					) {
+						try {
+							// 1. Get current history (includes final input/output pair)
+							// biome-ignore lint/suspicious/noExplicitAny: Calling potentially existing method
+							const currentHistory: BaseMessage[] = await (memory.chatHistory as any).getMessages();
+
+							// 2. Find the index of the last Human message (should be the user input)
+							let lastHumanIndex = -1;
+							for (let i = currentHistory.length - 1; i >= 0; i--) {
+								// Langchain uses _getType() internally
+								if (currentHistory[i]._getType() === 'human') {
+									lastHumanIndex = i;
+									break;
+								}
+							}
+
+							let reorderedHistory: BaseMessage[] = [];
+							if (lastHumanIndex !== -1) {
+								// 3. Reconstruct: History up to user input + intermediate steps + final AI answer
+								reorderedHistory = [
+									...currentHistory.slice(0, lastHumanIndex + 1), // History up to and including user input
+									...intermediateMessages, // Insert collected intermediate steps
+									...currentHistory.slice(lastHumanIndex + 1), // Should contain the final AI answer
+								];
+								// this.logger.debug(`[Memory Post-Processing] Reordered history length: ${reorderedHistory.length}`);
+							} else {
+								// Fallback: just append intermediate steps if user input wasn't found (should not happen)
+								// this.logger.warn('[Memory Post-Processing] Could not find last human message, appending intermediate steps.');
+								reorderedHistory = [...currentHistory, ...intermediateMessages];
+							}
+
+							// 4. Clear memory and add reordered history
+							// biome-ignore lint/suspicious/noExplicitAny: Calling potentially existing method
+							await (memory.chatHistory as any).clear();
+							// biome-ignore lint/suspicious/noExplicitAny: Calling potentially existing method
+							await (memory.chatHistory as any).addMessages(reorderedHistory);
+							// this.logger.info('[Memory Post-Processing] Memory history successfully reordered and saved.');
+						} catch (memError) {
+							// this.logger.error(`[Memory Post-Processing] Error reordering memory history: ${memError.message}`, { memError });
+						}
+					} else {
+						// this.logger.warn('[Memory Post-Processing] Memory object does not support required history manipulation methods (getMessages, clear, addMessages). Cannot reorder intermediate steps.');
+					}
+				}
+			}
+
 			// If memory and outputParser are connected, parse the output.
 			if (memory && outputParser && response.output) {
 				// Added check for response.output
@@ -546,9 +740,9 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 					);
 					response.output = parsedOutput?.output ?? parsedOutput;
 				} catch (e) {
-					this.logger.warn(
-						`Could not parse final output when memory and output parser were connected: ${e.message}`,
-					);
+					// this.logger.warn(
+					// 	`Could not parse final output when memory and output parser were connected: ${e.message}`,
+					// );
 				}
 			}
 
@@ -602,7 +796,7 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				baseResult.promptTokens = tokenUsage.promptTokens;
 				baseResult.completionTokens = tokenUsage.completionTokens;
 				baseResult.totalTokens = tokenUsage.totalTokens;
-				this.logger.debug('Token usage added to output:', tokenUsage);
+				// this.logger.debug('Token usage added to output:', tokenUsage);
 			}
 
 			const itemResult = {

@@ -59,6 +59,14 @@ export const toolsAgentProperties: INodeProperties[] = [
 					'Whether or not binary images should be automatically passed through to the agent as image type messages',
 			},
 			{
+				displayName: 'Save Intermediate Steps to Memory',
+				name: 'saveIntermediateStepsToMemory',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether to save the intermediate steps taken by the agent to the connected memory. Requires a memory sub-node connected.',
+			},
+			{
 				displayName: 'Output Tokens Consumption',
 				name: 'outputTokensConsumption',
 				type: 'boolean',
