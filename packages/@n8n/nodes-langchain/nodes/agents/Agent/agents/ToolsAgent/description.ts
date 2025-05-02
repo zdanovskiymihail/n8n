@@ -58,6 +58,14 @@ export const toolsAgentProperties: INodeProperties[] = [
 				description:
 					'Whether or not binary images should be automatically passed through to the agent as image type messages',
 			},
+			{
+				displayName: 'Output Tokens Consumption',
+				name: 'outputTokensConsumption',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether to include token usage information (promptTokens, completionTokens, totalTokens) in the output',
+			},
 		],
 	},
 ];
