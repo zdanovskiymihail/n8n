@@ -1,7 +1,8 @@
 import type { BaseChatMemory } from '@langchain/community/memory/chat_memory';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
-import { HumanMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
+// Import specific message types
+import { AIMessage, HumanMessage, ToolMessage, BaseMessage } from '@langchain/core/messages'; // Ensure BaseMessage is imported
+import type { InvalidToolCall, ToolCall } from '@langchain/core/messages/tool'; // Import ToolCall types
 import type { BaseMessagePromptTemplateLike } from '@langchain/core/prompts';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { RunnableSequence } from '@langchain/core/runnables';
@@ -12,9 +13,11 @@ import { AgentExecutor, createToolCallingAgent } from 'langchain/agents';
 import type { ToolsAgentAction } from 'langchain/dist/agents/tool_calling/output_parser';
 import { omit } from 'lodash';
 import { BINARY_ENCODING, jsonParse, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
-import type { IExecuteFunctions, INodeExecutionData } from 'n8n-workflow';
+import type { IExecuteFunctions, INodeExecutionData } from 'n8n-workflow'; // Removed Logger import
 import type { ZodObject } from 'zod';
 import { z } from 'zod';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base'; // Corrected import path
+import type { LLMResult } from '@langchain/core/outputs'; // Added LLMResult
 
 import { isChatInstance, getPromptInputByType, getConnectedTools } from '@utils/helpers';
 import {
@@ -286,7 +289,8 @@ export async function getChatModel(ctx: IExecuteFunctions): Promise<BaseChatMode
 }
 
 /**
- * Retrieves the memory instance from the input connection if it is connected
+ * Retrieves the memory instance from the input connection.
+ * NO LONGER WRAPS saveContext.
  *
  * @param ctx - The execution context
  * @returns The connected memory (if any)
@@ -294,9 +298,13 @@ export async function getChatModel(ctx: IExecuteFunctions): Promise<BaseChatMode
 export async function getOptionalMemory(
 	ctx: IExecuteFunctions,
 ): Promise<BaseChatMemory | undefined> {
-	return (await ctx.getInputConnectionData(NodeConnectionTypes.AiMemory, 0)) as
+	// Get the original memory (or undefined)
+	const memory = (await ctx.getInputConnectionData(NodeConnectionTypes.AiMemory, 0)) as
 		| BaseChatMemory
 		| undefined;
+
+	// Return the original memory object directly
+	return memory;
 }
 
 /**
@@ -389,6 +397,155 @@ export function preparePrompt(messages: BaseMessagePromptTemplateLike[]): ChatPr
 }
 
 /* -----------------------------------------------------------
+   Callback Handlers
+----------------------------------------------------------- */
+
+class MemoryStepsCallbackHandler extends BaseCallbackHandler {
+	name = 'MemoryStepsCallbackHandler';
+	private lastAction: ToolsAgentAction | undefined; // Changed type to ToolsAgentAction
+	// Array to collect intermediate messages
+	private intermediateMessages: BaseMessage[] = [];
+
+	constructor(/* Removed logger parameter */) {
+		super();
+	}
+
+	async handleAgentAction(action: ToolsAgentAction): Promise<void> {
+		// Changed type to ToolsAgentAction
+		this.lastAction = action;
+	}
+
+	async handleToolEnd(output: string, runId: string): Promise<void> {
+		if (this.lastAction) {
+			const action = this.lastAction;
+			this.lastAction = undefined;
+
+			const aiContent = `Thought: ${action.log}`;
+			const toolCalls: ToolCall[] = [];
+			if (action.toolCallId) {
+				let args: Record<string, any> = {};
+				try {
+					args =
+						typeof action.toolInput === 'string'
+							? jsonParse(action.toolInput)
+							: (action.toolInput as Record<string, any>);
+				} catch {
+					args = {};
+				}
+
+				toolCalls.push({
+					id: action.toolCallId,
+					name: action.tool,
+					args, // Используем объект напрямую
+					type: 'tool_call',
+				});
+			}
+			const aiMessage = new AIMessage({
+				content: aiContent,
+				tool_calls: toolCalls,
+				invalid_tool_calls: [],
+			});
+			this.intermediateMessages.push(aiMessage);
+
+			const toolMessage = new ToolMessage({
+				content: output,
+				tool_call_id: action.toolCallId ?? `tool_call_${runId}`,
+				name: action.tool,
+			});
+			this.intermediateMessages.push(toolMessage);
+		}
+	}
+
+	async handleToolError(error: Error | unknown, runId: string): Promise<void> {
+		if (this.lastAction) {
+			const action = this.lastAction;
+			this.lastAction = undefined;
+			const errorMessage = error instanceof Error ? error.message : String(error);
+
+			const aiContent = `Thought: ${action.log}`;
+			const toolCalls: ToolCall[] = [];
+			const invalidToolCalls: InvalidToolCall[] = [];
+			if (action.toolCallId) {
+				let args: Record<string, any> = {};
+				try {
+					args =
+						typeof action.toolInput === 'string'
+							? jsonParse(action.toolInput)
+							: (action.toolInput as Record<string, any>);
+				} catch {
+					args = {};
+				}
+
+				invalidToolCalls.push({
+					id: action.toolCallId,
+					name: action.tool,
+					args: JSON.stringify(args),
+					error: errorMessage,
+					type: 'invalid_tool_call',
+				});
+			}
+			const aiMessage = new AIMessage({
+				content: aiContent,
+				tool_calls: toolCalls,
+				invalid_tool_calls: invalidToolCalls,
+			});
+			this.intermediateMessages.push(aiMessage);
+
+			const toolMessage = new ToolMessage({
+				content: `Tool Error: ${errorMessage}`,
+				tool_call_id: action.toolCallId ?? `tool_call_${runId}_error`,
+				name: action.tool,
+			});
+			this.intermediateMessages.push(toolMessage);
+		}
+	}
+
+	// Method to retrieve collected messages
+	getIntermediateMessages(): BaseMessage[] {
+		return this.intermediateMessages;
+	}
+
+	// Ensure any stored action is cleared if the agent finishes without a final tool use
+	async handleAgentEnd(/* Removed action parameter */): Promise<void> {
+		if (this.lastAction) {
+			this.lastAction = undefined;
+		}
+	}
+}
+
+class TokenUsageCallbackHandler extends BaseCallbackHandler {
+	name = 'TokenUsageCallbackHandler';
+	promptTokens = 0;
+	completionTokens = 0;
+	totalTokens = 0;
+
+	// Using handleLLMEnd to capture usage after each LLM call within the agent
+	async handleLLMEnd(output: LLMResult): Promise<void> {
+		const tokenUsage = output.llmOutput?.tokenUsage;
+		if (tokenUsage) {
+			this.promptTokens += tokenUsage.promptTokens ?? 0;
+			this.completionTokens += tokenUsage.completionTokens ?? 0;
+			this.totalTokens += tokenUsage.totalTokens ?? 0;
+		}
+	}
+
+	getUsage() {
+		return {
+			promptTokens: this.promptTokens,
+			completionTokens: this.completionTokens,
+			totalTokens: this.totalTokens,
+		};
+	}
+
+	// Reset counts for each new item being processed by the node
+	reset() {
+		this.promptTokens = 0;
+		this.completionTokens = 0;
+		this.totalTokens = 0;
+	}
+}
+
+/* -----------------------------------------------------------
    Main Executor Function
 ----------------------------------------------------------- */
 /**
@@ -401,17 +558,17 @@ export function preparePrompt(messages: BaseMessagePromptTemplateLike[]): ChatPr
  * @returns The array of execution data for all processed items
  */
 export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-	this.logger.debug('Executing Tools Agent');
-
 	const returnData: INodeExecutionData[] = [];
 	const items = this.getInputData();
 	const outputParser = await getOptionalOutputParser(this);
 	const tools = await getTools(this, outputParser);
 
 	for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+		const tokenCallbackHandler = new TokenUsageCallbackHandler(); // Instantiate handler
+		let memoryStepsCallbackHandler: MemoryStepsCallbackHandler | undefined; // Keep reference
 		try {
 			const model = await getChatModel(this);
-			const memory = await getOptionalMemory(this);
+			const memory = await getOptionalMemory(this); // Use updated getOptionalMemory
 
 			const input = getPromptInputByType({
 				ctx: this,
@@ -427,7 +584,9 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				systemMessage?: string;
 				maxIterations?: number;
 				returnIntermediateSteps?: boolean;
+				saveIntermediateStepsToMemory?: boolean; // Added option
 				passthroughBinaryImages?: boolean;
+				outputTokensConsumption?: boolean; // Added option
 			};
 
 			// Prepare the prompt messages and prompt template.
@@ -452,15 +611,34 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				getAgentStepsParser(outputParser, memory),
 				fixEmptyContentMessage,
 			]);
+
+			// Determine if intermediate steps need to be returned by the executor
+			const shouldReturnIntermediateSteps =
+				options.returnIntermediateSteps === true || options.saveIntermediateStepsToMemory === true;
+
+			// Prepare callbacks array
+			const callbacks: BaseCallbackHandler[] = [];
+			if (options.outputTokensConsumption) {
+				callbacks.push(tokenCallbackHandler); // Add token handler if option is enabled
+			}
+			// Add memory steps handler if option enabled and memory connected
+			if (memory && options.saveIntermediateStepsToMemory) {
+				// Pass this.logger to the handler constructor
+				memoryStepsCallbackHandler = new MemoryStepsCallbackHandler(/* Removed this.logger */); // Removed argument
+				callbacks.push(memoryStepsCallbackHandler);
+			}
+
+			// Create the AgentExecutor
 			const executor = AgentExecutor.fromAgentAndTools({
+				// Restored executor declaration
 				agent: runnableAgent,
-				memory,
+				memory, // Pass the ORIGINAL memory
 				tools,
-				returnIntermediateSteps: options.returnIntermediateSteps === true,
+				returnIntermediateSteps: shouldReturnIntermediateSteps, // Use calculated value
 				maxIterations: options.maxIterations ?? 10,
 			});
 
-			// Invoke the executor with the given input and system message.
+			// Invoke the executor with the cleaned input and system message.
 			const response = await executor.invoke(
 				{
 					input,
@@ -468,27 +646,122 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 					formatting_instructions:
 						'IMPORTANT: For your response to user, you MUST use the `format_final_json_response` tool with your complete answer formatted according to the required schema. Do not attempt to format the JSON manually - always use this tool. Your response will be rejected if it is not properly formatted through this tool. Only use this tool once you are ready to provide your final answer.',
 				},
-				{ signal: this.getExecutionCancelSignal() },
+				{ signal: this.getExecutionCancelSignal(), callbacks }, // Pass callbacks here
 			);
 
+			// --- Post-execution Memory Handling for Intermediate Steps ---
+			if (memory && options.saveIntermediateStepsToMemory && memoryStepsCallbackHandler) {
+				const intermediateMessages = memoryStepsCallbackHandler.getIntermediateMessages();
+				if (intermediateMessages.length > 0) {
+					// biome-ignore lint/suspicious/noExplicitAny: Checking for method existence
+					if (
+						memory.chatHistory &&
+						typeof (memory.chatHistory as any).getMessages === 'function' &&
+						typeof (memory.chatHistory as any).clear === 'function' &&
+						typeof (memory.chatHistory as any).addMessages === 'function'
+					) {
+						try {
+							// 1. Get current history (includes final input/output pair)
+							// biome-ignore lint/suspicious/noExplicitAny: Calling potentially existing method
+							const currentHistory: BaseMessage[] = await (memory.chatHistory as any).getMessages();
+
+							// 2. Find the index of the last Human message (should be the user input)
+							let lastHumanIndex = -1;
+							for (let i = currentHistory.length - 1; i >= 0; i--) {
+								// Langchain uses _getType() internally
+								if (currentHistory[i]._getType() === 'human') {
+									lastHumanIndex = i;
+									break;
+								}
+							}
+
+							let reorderedHistory: BaseMessage[] = [];
+							if (lastHumanIndex !== -1) {
+								// 3. Reconstruct: History up to user input + intermediate steps + final AI answer
+								reorderedHistory = [
+									...currentHistory.slice(0, lastHumanIndex + 1), // History up to and including user input
+									...intermediateMessages, // Insert collected intermediate steps
+									...currentHistory.slice(lastHumanIndex + 1), // Should contain the final AI answer
+								];
+							} else {
+								// Fallback: just append intermediate steps if user input wasn't found (should not happen)
+								reorderedHistory = [...currentHistory, ...intermediateMessages];
+							}
+
+							// 4. Clear memory and add reordered history
+							// biome-ignore lint/suspicious/noExplicitAny: Calling potentially existing method
+							await (memory.chatHistory as any).clear();
+							// biome-ignore lint/suspicious/noExplicitAny: Calling potentially existing method
+							await (memory.chatHistory as any).addMessages(reorderedHistory);
+						} catch (memError) {
+							// Error handling for memory operations if needed, but no logging requested
+						}
+					}
+				}
+			}
+
 			// If memory and outputParser are connected, parse the output.
-			if (memory && outputParser) {
-				const parsedOutput = jsonParse<{ output: Record<string, unknown> }>(
-					response.output as string,
-				);
-				response.output = parsedOutput?.output ?? parsedOutput;
+			if (memory && outputParser && response.output) {
+				try {
+					const parsedOutput = jsonParse<{ output: Record<string, unknown> }>(
+						response.output as string,
+					);
+					response.output = parsedOutput?.output ?? parsedOutput;
+				} catch (e) {
+					// Error handling for parsing if needed, but no logging requested
+				}
+			}
+
+			// Extract token usage information before omitting internal keys
+			let tokenUsage;
+			if (options.outputTokensConsumption) {
+				const usageInfoFromCallback = tokenCallbackHandler.getUsage();
+
+				if (usageInfoFromCallback.totalTokens > 0) {
+					tokenUsage = {
+						promptTokens: usageInfoFromCallback.promptTokens,
+						completionTokens: usageInfoFromCallback.completionTokens,
+						totalTokens: usageInfoFromCallback.totalTokens,
+					};
+				} else {
+					// Check various possible locations of token usage info in the response
+					tokenUsage =
+						response.tokenUsage ??
+						response.tokenUsageEstimate ??
+						response.usage ??
+						(Array.isArray(response) && response[0]?.tokenUsage) ??
+						(Array.isArray(response) && response[0]?.tokenUsageEstimate) ??
+						(Array.isArray(response) && response[0]?.usage);
+
+					if (!tokenUsage) {
+						// Try to find it in response.response structure
+						const resp = response.response ?? (Array.isArray(response) && response[0]?.response);
+						if (resp?.tokenUsage || resp?.tokenUsageEstimate || resp?.usage) {
+							tokenUsage = resp.tokenUsage ?? resp.tokenUsageEstimate ?? resp.usage;
+						}
+					}
+				}
 			}
 
 			// Omit internal keys before returning the result.
+			const baseResult = omit(
+				response,
+				'system_message',
+				'formatting_instructions',
+				'input',
+				'chat_history',
+				'agent_scratchpad',
+			) as Record<string, any>;
+
+			// Add token usage to the result if available
+			if (options.outputTokensConsumption && tokenUsage) {
+				baseResult.promptTokens = tokenUsage.promptTokens;
+				baseResult.completionTokens = tokenUsage.completionTokens;
+				baseResult.totalTokens = tokenUsage.totalTokens;
+			}
+
 			const itemResult = {
-				json: omit(
-					response,
-					'system_message',
-					'formatting_instructions',
-					'input',
-					'chat_history',
-					'agent_scratchpad',
-				),
+				json: baseResult,
 			};
 
 			returnData.push(itemResult);
