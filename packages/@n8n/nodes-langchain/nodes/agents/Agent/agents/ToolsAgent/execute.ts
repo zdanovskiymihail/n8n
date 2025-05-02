@@ -12,10 +12,11 @@ import type { Tool } from '@langchain/core/tools';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import type { AgentAction, AgentFinish } from 'langchain/agents';
 import { AgentExecutor, createToolCallingAgent } from 'langchain/agents';
+// Import ToolsAgentAction specifically
 import type { ToolsAgentAction } from 'langchain/dist/agents/tool_calling/output_parser';
 import { omit } from 'lodash';
 import { BINARY_ENCODING, jsonParse, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
-import type { IExecuteFunctions, INodeExecutionData, ILogger } from 'n8n-workflow'; // Added ILogger
+import type { IExecuteFunctions, INodeExecutionData, Logger } from 'n8n-workflow'; // Added Logger
 import type { ZodObject } from 'zod';
 import { z } from 'zod';
 
@@ -408,17 +409,19 @@ export function preparePrompt(messages: BaseMessagePromptTemplateLike[]): ChatPr
 
 class MemoryStepsCallbackHandler extends BaseCallbackHandler {
 	name = 'MemoryStepsCallbackHandler';
-	private lastAction: AgentAction | undefined;
+	// Use ToolsAgentAction which includes toolCallId
+	private lastAction: ToolsAgentAction | undefined;
 	// Array to collect intermediate messages
 	private intermediateMessages: BaseMessage[] = [];
 
-	constructor(private logger: ILogger) {
+	constructor(private logger: Logger) {
 		// Memory no longer needed here
 		super();
 		// this.logger.debug('MemoryStepsCallbackHandler initialized.');
 	}
 
-	async handleAgentAction(action: AgentAction): Promise<void> {
+	// Update parameter type to ToolsAgentAction
+	async handleAgentAction(action: ToolsAgentAction): Promise<void> {
 		// Store the action, don't save yet
 		// this.logger.debug(`[MemoryCallback] Storing action: ${action.tool} with toolCallId: ${action.toolCallId}`);
 		this.lastAction = action;
@@ -426,6 +429,7 @@ class MemoryStepsCallbackHandler extends BaseCallbackHandler {
 
 	async handleToolEnd(output: string, runId: string): Promise<void> {
 		if (this.lastAction) {
+			// lastAction is now correctly typed as ToolsAgentAction
 			const action = this.lastAction;
 			this.lastAction = undefined; // Clear the stored action
 
@@ -435,6 +439,7 @@ class MemoryStepsCallbackHandler extends BaseCallbackHandler {
 			const aiContent = `Thought: ${action.log}`; // Keep content concise, details are in tool_calls
 			// Construct the tool_calls array for the AIMessage
 			const toolCalls: ToolCall[] = [];
+			// Access toolCallId safely
 			if (action.toolCallId) {
 				toolCalls.push({
 					id: action.toolCallId,
@@ -457,6 +462,7 @@ class MemoryStepsCallbackHandler extends BaseCallbackHandler {
 			// 2. Create Tool message representing the observation
 			const toolMessage = new ToolMessage({
 				content: output,
+				// Access toolCallId safely
 				tool_call_id: action.toolCallId ?? `tool_call_${runId}`, // Use the same ID
 				name: action.tool, // Include tool name for clarity if needed, though redundant with AIMessage
 			});
@@ -468,6 +474,7 @@ class MemoryStepsCallbackHandler extends BaseCallbackHandler {
 
 	async handleToolError(error: Error | unknown, runId: string): Promise<void> {
 		if (this.lastAction) {
+			// lastAction is now correctly typed as ToolsAgentAction
 			const action = this.lastAction;
 			this.lastAction = undefined; // Clear the stored action
 			const errorMessage = error instanceof Error ? error.message : String(error);
@@ -479,13 +486,16 @@ class MemoryStepsCallbackHandler extends BaseCallbackHandler {
 			const toolCalls: ToolCall[] = [];
 			const invalidToolCalls: InvalidToolCall[] = []; // Use invalidToolCalls for errors
 
+			// Access toolCallId safely
 			if (action.toolCallId) {
 				// Represent the failed call in invalid_tool_calls
 				invalidToolCalls.push({
 					id: action.toolCallId,
 					name: action.tool,
 					args:
-						typeof action.toolInput === 'string' ? jsonParse(action.toolInput) : action.toolInput, // Use jsonParse safely
+						typeof action.toolInput === 'string'
+							? action.toolInput
+							: JSON.stringify(action.toolInput), // Ensure args is a string
 					error: errorMessage, // Add error message here
 					type: 'invalid_tool_call', // Explicitly set type
 				});
@@ -502,6 +512,7 @@ class MemoryStepsCallbackHandler extends BaseCallbackHandler {
 			// It might be redundant if the error is in invalid_tool_calls, but can be useful
 			const toolMessage = new ToolMessage({
 				content: `Tool Error: ${errorMessage}`,
+				// Access toolCallId safely
 				tool_call_id: action.toolCallId ?? `tool_call_${runId}_error`, // Use the same ID
 				name: action.tool,
 			});
