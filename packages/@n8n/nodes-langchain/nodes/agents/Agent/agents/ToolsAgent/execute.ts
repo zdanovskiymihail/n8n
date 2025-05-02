@@ -1,4 +1,6 @@
 import type { BaseChatMemory } from '@langchain/community/memory/chat_memory';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base'; // Added
+import type { LLMResult } from '@langchain/core/outputs'; // Added
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -12,7 +14,7 @@ import { AgentExecutor, createToolCallingAgent } from 'langchain/agents';
 import type { ToolsAgentAction } from 'langchain/dist/agents/tool_calling/output_parser';
 import { omit } from 'lodash';
 import { BINARY_ENCODING, jsonParse, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
-import type { IExecuteFunctions, INodeExecutionData } from 'n8n-workflow';
+import type { IExecuteFunctions, INodeExecutionData } from 'n8n-workflow'; // Added ILogger
 import type { ZodObject } from 'zod';
 import { z } from 'zod';
 
@@ -389,6 +391,42 @@ export function preparePrompt(messages: BaseMessagePromptTemplateLike[]): ChatPr
 }
 
 /* -----------------------------------------------------------
+   Callback Handlers
+----------------------------------------------------------- */
+
+class TokenUsageCallbackHandler extends BaseCallbackHandler {
+	name = 'TokenUsageCallbackHandler';
+	promptTokens = 0;
+	completionTokens = 0;
+	totalTokens = 0;
+
+	// Using handleLLMEnd to capture usage after each LLM call within the agent
+	async handleLLMEnd(output: LLMResult): Promise<void> {
+		const tokenUsage = output.llmOutput?.tokenUsage;
+		if (tokenUsage) {
+			this.promptTokens += tokenUsage.promptTokens ?? 0;
+			this.completionTokens += tokenUsage.completionTokens ?? 0;
+			this.totalTokens += tokenUsage.totalTokens ?? 0;
+		}
+	}
+
+	getUsage() {
+		return {
+			promptTokens: this.promptTokens,
+			completionTokens: this.completionTokens,
+			totalTokens: this.totalTokens,
+		};
+	}
+
+	// Reset counts for each new item being processed by the node
+	reset() {
+		this.promptTokens = 0;
+		this.completionTokens = 0;
+		this.totalTokens = 0;
+	}
+}
+
+/* -----------------------------------------------------------
    Main Executor Function
 ----------------------------------------------------------- */
 /**
@@ -409,6 +447,7 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 	const tools = await getTools(this, outputParser);
 
 	for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+		const tokenCallbackHandler = new TokenUsageCallbackHandler(); // Instantiate handler
 		try {
 			const model = await getChatModel(this);
 			const memory = await getOptionalMemory(this);
@@ -428,6 +467,7 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				maxIterations?: number;
 				returnIntermediateSteps?: boolean;
 				passthroughBinaryImages?: boolean;
+				outputTokensConsumption?: boolean; // Added outputTokensConsumption option
 			};
 
 			// Prepare the prompt messages and prompt template.
@@ -460,7 +500,13 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				maxIterations: options.maxIterations ?? 10,
 			});
 
-			// Invoke the executor with the given input and system message.
+			// Prepare callbacks array
+			const callbacks: BaseCallbackHandler[] = [];
+			if (options.outputTokensConsumption) {
+				callbacks.push(tokenCallbackHandler); // Add token handler if option is enabled
+			}
+
+			// Invoke the executor with the cleaned input and system message.
 			const response = await executor.invoke(
 				{
 					input,
@@ -468,7 +514,10 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 					formatting_instructions:
 						'IMPORTANT: For your response to user, you MUST use the `format_final_json_response` tool with your complete answer formatted according to the required schema. Do not attempt to format the JSON manually - always use this tool. Your response will be rejected if it is not properly formatted through this tool. Only use this tool once you are ready to provide your final answer.',
 				},
-				{ signal: this.getExecutionCancelSignal() },
+				{
+					signal: this.getExecutionCancelSignal(),
+					callbacks, // Pass callbacks array
+				},
 			);
 
 			// If memory and outputParser are connected, parse the output.
@@ -479,9 +528,40 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				response.output = parsedOutput?.output ?? parsedOutput;
 			}
 
+			// Extract token usage information before omitting internal keys
+			let tokenUsage;
+			if (options.outputTokensConsumption) {
+				const usageInfoFromCallback = tokenCallbackHandler.getUsage();
+
+				if (usageInfoFromCallback.totalTokens > 0) {
+					tokenUsage = {
+						promptTokens: usageInfoFromCallback.promptTokens,
+						completionTokens: usageInfoFromCallback.completionTokens,
+						totalTokens: usageInfoFromCallback.totalTokens,
+					};
+				} else {
+					// Check various possible locations of token usage info in the response
+					tokenUsage =
+						response.tokenUsage ??
+						response.tokenUsageEstimate ??
+						response.usage ??
+						(Array.isArray(response) && response[0]?.tokenUsage) ??
+						(Array.isArray(response) && response[0]?.tokenUsageEstimate) ??
+						(Array.isArray(response) && response[0]?.usage);
+
+					if (!tokenUsage) {
+						// Try to find it in response.response structure
+						const resp = response.response ?? (Array.isArray(response) && response[0]?.response);
+						if (resp?.tokenUsage || resp?.tokenUsageEstimate || resp?.usage) {
+							tokenUsage = resp.tokenUsage ?? resp.tokenUsageEstimate ?? resp.usage;
+						}
+					}
+				}
+			}
+
 			// Omit internal keys before returning the result.
-			const itemResult = {
-				json: omit(
+			const baseResult = {
+				...omit(
 					response,
 					'system_message',
 					'formatting_instructions',
@@ -489,10 +569,23 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 					'chat_history',
 					'agent_scratchpad',
 				),
+			} as Record<string, any>;
+
+			// Add token usage to the result if available
+			if (options.outputTokensConsumption && tokenUsage) {
+				baseResult.promptTokens = tokenUsage.promptTokens;
+				baseResult.completionTokens = tokenUsage.completionTokens;
+				baseResult.totalTokens = tokenUsage.totalTokens;
+				this.logger.debug('Token usage added to output:', tokenUsage);
+			}
+
+			const itemResult = {
+				json: baseResult,
 			};
 
 			returnData.push(itemResult);
 		} catch (error) {
+			tokenCallbackHandler.reset(); // Reset handler on error
 			if (this.continueOnFail()) {
 				returnData.push({
 					json: { error: error.message },
