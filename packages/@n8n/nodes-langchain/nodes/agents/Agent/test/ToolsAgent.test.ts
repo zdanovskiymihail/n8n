@@ -10,6 +10,7 @@ import type { IExecuteFunctions, INode } from 'n8n-workflow';
 import { NodeOperationError, BINARY_ENCODING, NodeConnectionTypes } from 'n8n-workflow';
 import type { ZodType } from 'zod';
 import { z } from 'zod';
+import type { LLMResult } from '@langchain/core/outputs';
 
 import type { N8nOutputParser } from '@utils/output_parsers/N8nOutputParser';
 
@@ -23,6 +24,7 @@ import {
 	prepareMessages,
 	preparePrompt,
 	getTools,
+	TokenUsageCallbackHandler,
 } from '../agents/ToolsAgent/execute';
 
 function getFakeOutputParser(returnSchema?: ZodType): N8nOutputParser {
@@ -339,5 +341,108 @@ describe('preparePrompt', () => {
 		const prompt = preparePrompt(sampleMessages);
 
 		expect(prompt).toBeDefined();
+	});
+});
+
+describe('TokenUsageCallbackHandler', () => {
+	let handler: TokenUsageCallbackHandler;
+
+	beforeEach(() => {
+		handler = new TokenUsageCallbackHandler();
+	});
+
+	it('should track token usage from LLM calls', async () => {
+		const fakeOutput: LLMResult = {
+			generations: [],
+			llmOutput: {
+				tokenUsage: {
+					promptTokens: 10,
+					completionTokens: 20,
+					totalTokens: 30,
+				},
+			},
+		};
+
+		await handler.handleLLMEnd(fakeOutput);
+
+		const usage = handler.getUsage();
+		expect(usage).toEqual({
+			promptTokens: 10,
+			completionTokens: 20,
+			totalTokens: 30,
+		});
+	});
+
+	it('should accumulate token usage from multiple LLM calls', async () => {
+		const firstOutput: LLMResult = {
+			generations: [],
+			llmOutput: {
+				tokenUsage: {
+					promptTokens: 10,
+					completionTokens: 20,
+					totalTokens: 30,
+				},
+			},
+		};
+
+		const secondOutput: LLMResult = {
+			generations: [],
+			llmOutput: {
+				tokenUsage: {
+					promptTokens: 15,
+					completionTokens: 25,
+					totalTokens: 40,
+				},
+			},
+		};
+
+		await handler.handleLLMEnd(firstOutput);
+		await handler.handleLLMEnd(secondOutput);
+
+		const usage = handler.getUsage();
+		expect(usage).toEqual({
+			promptTokens: 25,
+			completionTokens: 45,
+			totalTokens: 70,
+		});
+	});
+
+	it('should handle missing token usage data', async () => {
+		const outputWithoutUsage: LLMResult = {
+			generations: [],
+			llmOutput: {},
+		};
+
+		await handler.handleLLMEnd(outputWithoutUsage);
+
+		const usage = handler.getUsage();
+		expect(usage).toEqual({
+			promptTokens: 0,
+			completionTokens: 0,
+			totalTokens: 0,
+		});
+	});
+
+	it('should reset token counts', async () => {
+		const fakeOutput: LLMResult = {
+			generations: [],
+			llmOutput: {
+				tokenUsage: {
+					promptTokens: 10,
+					completionTokens: 20,
+					totalTokens: 30,
+				},
+			},
+		};
+
+		await handler.handleLLMEnd(fakeOutput);
+		handler.reset();
+
+		const usage = handler.getUsage();
+		expect(usage).toEqual({
+			promptTokens: 0,
+			completionTokens: 0,
+			totalTokens: 0,
+		});
 	});
 });

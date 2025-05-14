@@ -394,7 +394,7 @@ export function preparePrompt(messages: BaseMessagePromptTemplateLike[]): ChatPr
    Callback Handlers
 ----------------------------------------------------------- */
 
-class TokenUsageCallbackHandler extends BaseCallbackHandler {
+export class TokenUsageCallbackHandler extends BaseCallbackHandler {
 	name = 'TokenUsageCallbackHandler';
 	promptTokens = 0;
 	completionTokens = 0;
