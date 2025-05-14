@@ -1,5 +1,5 @@
 {
-  "name": "AI Agent tokens consumption output option use case",
+  "name": "AI Agent output tokens consumption option use case",
   "nodes": [
     {
       "parameters": {
@@ -166,6 +166,29 @@
           "name": "Postgres account"
         }
       }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "98e539e4-b627-481c-9e27-bd19b91f7258",
+              "name": "output",
+              "value": "={{ $('AI Agent').item.json.output }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        780,
+        0
+      ],
+      "id": "8c8805f3-9741-4cfd-962e-5f811b594a4a",
+      "name": "Pass agent output"
     }
   ],
   "pinData": {},
@@ -213,13 +236,29 @@
           }
         ]
       ]
+    },
+    "Save tokens consumption to DB": {
+      "main": [
+        [
+          {
+            "node": "Pass agent output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pass agent output": {
+      "main": [
+        []
+      ]
     }
   },
   "active": false,
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "0e2f8bd3-6896-4895-93d1-6d403d4d68aa",
+  "versionId": "9942ed23-f24e-40f2-a853-e7e92a39856f",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "2fc43cd6f4acc2664335c9c27d2718a985653b4b4f3c7b028198251580225323"
